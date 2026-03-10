@@ -1,0 +1,1116 @@
+olevba 0.60.2 on Python 3.12.12 - http://decalage.info/python/oletools
+===============================================================================
+FILE: Portfolio_Optimizer_LS.xlsm
+Type: OpenXML
+WARNING  For now, VBA stomping cannot be detected for files in memory
+-------------------------------------------------------------------------------
+VBA MACRO ThisWorkbook.cls
+in file: xl/vbaProject.bin - OLE stream: 'VBA/ThisWorkbook'
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+(empty macro)
+-------------------------------------------------------------------------------
+VBA MACRO Sheet1.cls
+in file: xl/vbaProject.bin - OLE stream: 'VBA/Sheet1'
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+(empty macro)
+-------------------------------------------------------------------------------
+VBA MACRO Sheet2.cls
+in file: xl/vbaProject.bin - OLE stream: 'VBA/Sheet2'
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+(empty macro)
+-------------------------------------------------------------------------------
+VBA MACRO Sheet3.cls
+in file: xl/vbaProject.bin - OLE stream: 'VBA/Sheet3'
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+(empty macro)
+-------------------------------------------------------------------------------
+VBA MACRO Sheet4.cls
+in file: xl/vbaProject.bin - OLE stream: 'VBA/Sheet4'
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+(empty macro)
+-------------------------------------------------------------------------------
+VBA MACRO Sheet5.cls
+in file: xl/vbaProject.bin - OLE stream: 'VBA/Sheet5'
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+(empty macro)
+-------------------------------------------------------------------------------
+VBA MACRO Main.bas
+in file: xl/vbaProject.bin - OLE stream: 'VBA/Main'
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Option Explicit
+Option Base 1
+
+' ==========================================================================================
+' PORTFOLIO OPTIMIZER VBA CODE
+' ==========================================================================================
+
+
+Private Const WEIGHTS_SHEET As String = "SimulatedWeights"
+Private Const DASH_SHEET As String = "Dashboard"
+Private Const ENGINE_SHEET As String = "Engine"
+Private Const CHART_SHEET As String = "ChartData"
+
+
+' ==========================================================
+' MAIN ENTRY POINTS
+' ==========================================================
+
+Sub RunUpdateMatrices()
+    Application.ScreenUpdating = False
+    Call RunClean
+
+    Dim prices() As Variant, dates() As Date, assetNames() As String
+    Call GetHistoricalDataDatesAndNames(prices, dates, assetNames)
+    If UBound(prices, 2) < 1 Then Exit Sub
+
+    Dim strategies As Variant
+    strategies = Array("EQUAL WEIGHT", "ERC UNCSTRD", "ER/VOL", "SHARPE", "MIN VAR", "KELLY", "CUSTOM", "MEAN")
+
+    Call SyncDashboardHeaders(dates, assetNames, strategies)
+    Call UpdateCurrentPrices(prices)
+
+    Dim logRets() As Double, meanRets() As Double
+    Call CalculateHistoricalStats(dates, prices, logRets, meanRets)
+    Call ProcessIndividualAssets(prices, dates, logRets, assetNames)
+
+    MsgBox "Data Updated. Matrices Built.", vbInformation
+    Application.ScreenUpdating = True
+End Sub
+
+Sub RunAllSolvers()
+    Application.ScreenUpdating = False
+    Sheets(ENGINE_SHEET).Activate
+
+    Dim prices() As Variant, dates() As Date, assetNames() As String
+    Call GetHistoricalDataDatesAndNames(prices, dates, assetNames)
+
+    Dim logRets() As Double, meanRets() As Double
+    Call CalculateHistoricalStats(dates, prices, logRets, meanRets)
+
+    Dim covMat() As Double
+    covMat = CalculateCovariance(logRets, meanRets)
+    Call OutputCorrelationMatrix(covMat, assetNames)
+
+    Dim expReturns() As Double
+    Dim lastDate As Date
+    lastDate = dates(UBound(dates))
+    expReturns = CalculateExpectedReturns(meanRets, lastDate)
+
+    Dim wsDash As Worksheet
+    Set wsDash = Sheets(DASH_SHEET)
+    Dim inputStart As Long
+    inputStart = wsDash.Range("InputTableStart").Row + 1
+
+    Dim k As Integer, nAssets As Integer
+    nAssets = UBound(assetNames)
+    For k = 1 To nAssets
+        wsDash.Cells(inputStart + k - 1, wsDash.Range("AssetMetricsStart").Column - 1).Value = expReturns(k)
+    Next k
+
+    Call WriteToEngine(covMat, expReturns)
+
+
+    Dim strategies As Variant
+    strategies = Array("EQUAL WEIGHT", "ERC UNCSTRD", "ER/VOL", "SHARPE", "MIN VAR", "KELLY", "CUSTOM", "MEAN")
+
+    Call SyncSimWeightsHeaders(dates, assetNames, strategies)
+
+    Dim minWeights() As Double, maxWeights() As Double
+    ReDim minWeights(1 To nAssets)
+    ReDim maxWeights(1 To nAssets)
+
+    For k = 1 To nAssets
+        If IsEmpty(wsDash.Cells(inputStart + k - 1, wsDash.Range("maxWeightCol").Column).Value) Then
+            maxWeights(k) = 1
+        Else
+            maxWeights(k) = wsDash.Cells(inputStart + k - 1, wsDash.Range("maxWeightCol").Column).Value
+        End If
+        If IsEmpty(wsDash.Cells(inputStart + k - 1, wsDash.Range("maxWeightCol").Column - 1).Value) Then
+            minWeights(k) = 0
+        Else
+            minWeights(k) = wsDash.Cells(inputStart + k - 1, wsDash.Range("maxWeightCol").Column - 1).Value
+        End If
+    Next k
+
+    Dim wsEngC As Worksheet
+    Set wsEngC = Sheets(ENGINE_SHEET)
+    Dim optRangeC As Range
+    Set optRangeC = wsEngC.Range("OptWeights")
+
+    Dim cVal As Double
+    Dim m As Integer
+    Dim i As Integer
+
+
+    Dim sumWeights() As Double
+    ReDim sumWeights(1 To nAssets)
+    Dim wCount As Integer
+    wCount = UBound(strategies) - 1 ' All strategies except MEAN
+
+    For m = 1 To nAssets
+        sumWeights(m) = 0
+    Next m
+
+    For i = LBound(strategies) To UBound(strategies)
+        Dim stratName As String
+        stratName = UCase(strategies(i))
+
+        Dim eqW As Double
+        eqW = 1 / nAssets
+        Dim wsEng As Worksheet
+        Set wsEng = Sheets(ENGINE_SHEET)
+        Dim optRange As Range
+        Set optRange = wsEng.Range("OptWeights")
+        Dim j As Integer
+        For j = 1 To nAssets
+            optRange.Cells(1, j).Value = eqW
+        Next j
+
+        If stratName = "EQUAL WEIGHT" Then
+            'done
+
+        ElseIf stratName = "CUSTOM" Then
+
+            For m = 1 To nAssets
+                cVal = wsDash.Cells(inputStart + m - 1, wsDash.Range("customWeightCol").Column).Value
+                optRangeC.Cells(1, m).Value = cVal
+            Next m
+
+        ElseIf stratName = "ER/VOL" Then
+
+            For m = 1 To nAssets
+                cVal = wsDash.Cells(inputStart + m - 1, wsDash.Range("AssetMetricsStart").Column - 1).Value / _
+                          wsDash.Cells(inputStart + m - 1, wsDash.Range("AssetMetricsStart").Column + 1).Value
+                optRangeC.Cells(1, m).Value = cVal
+            Next m
+
+            Dim currentSum As Double
+            currentSum = Application.WorksheetFunction.Sum(optRange)
+
+            If currentSum <> 0 Then
+                Dim finalWeights() As Variant
+                ReDim finalWeights(1 To nAssets)
+                For m = 1 To nAssets
+                    finalWeights(m) = optRange.Cells(1, m).Value / currentSum
+                Next m
+                optRange.Value = finalWeights
+            End If
+
+        ElseIf stratName = "MEAN" Then
+
+            For m = 1 To nAssets
+                optRange.Cells(1, m).Value = sumWeights(m) / wCount
+            Next m
+
+        Else
+
+            ' Optimization: Sharpe, Variance, Kelly, ERC UNCSTRD
+            Call RunSolver(CStr(strategies(i)), minWeights, maxWeights, False)
+
+        End If
+
+        Dim w As Variant
+        w = Sheets(ENGINE_SHEET).Range("OptWeights").Value
+
+        If stratName <> "MEAN" Then
+            For m = 1 To nAssets
+                sumWeights(m) = sumWeights(m) + w(1, m)
+            Next m
+        End If
+
+        Dim equityCurve() As Double, ddCurve() As Double, dailyWeights() As Double
+        Dim mRet As Double, mVol As Double, mSharpe As Double, mMDD As Double, mLen As Integer, mVaR As Double
+
+        Call SimulatePortfolio(prices, dates, w, equityCurve, dailyWeights, ddCurve, mRet, mVol, mSharpe, mMDD, mLen, mVaR)
+
+        Call OutputMetricsToRow(i - 1, CStr(strategies(i)), mRet, mVol, mSharpe, mMDD, mLen, mVaR, w, "StrategyTableStart", True)
+
+        Dim colOffset As Integer
+        colOffset = (nAssets + 1) + i
+        Call WriteCurveToSheet(equityCurve, colOffset)
+
+        Dim ddColOffset As Integer
+        ddColOffset = (nAssets + 1) + UBound(strategies) + i
+        Call WriteCurveToSheet(ddCurve, ddColOffset)
+
+        Dim wColStart As Integer
+        wColStart = 2 + (i - 1) * nAssets
+        Call WriteWeightsToSheet(dailyWeights, wColStart)
+    Next i
+
+    Call DrawEfficientFrontier(nAssets, maxWeights)
+
+    Sheets(DASH_SHEET).Activate
+
+    Call UpdateDashboardCharts(nAssets, UBound(strategies), lastDate)
+
+    Application.ScreenUpdating = True
+    MsgBox "Optimization & Efficient Frontier Complete.", vbInformation
+End Sub
+
+
+' ==========================================================
+' CLEAN
+' ==========================================================
+
+Sub RunClean()
+    Dim wsDash As Worksheet
+    Set wsDash = Sheets(DASH_SHEET)
+
+    Dim stratR As Long, stratC As Long
+    stratR = wsDash.Range("StrategyTableStart").Row + 1
+    stratC = wsDash.Range("StrategyTableStart").Column
+    wsDash.Range(wsDash.Cells(stratR, stratC), wsDash.Cells(stratR + 5, stratC + 100)).ClearContents
+
+    Dim inputR As Long, inputC As Long
+    inputR = wsDash.Range("InputTableStart").Row + 1
+    inputC = wsDash.Range("InputTableStart").Column
+    wsDash.Range(wsDash.Cells(inputR, inputC), wsDash.Cells(stratR - 3, inputC)).ClearContents
+    wsDash.Range(wsDash.Cells(inputR, inputC + 2), wsDash.Cells(stratR - 3, inputC + 2)).ClearContents
+    wsDash.Range(wsDash.Cells(inputR, wsDash.Range("AssetMetricsStart").Column - 1), wsDash.Cells(stratR - 2, wsDash.Range("InputTableStart").End(xlToRight).Column)).ClearContents
+
+    Dim corrR As Long
+    corrR = wsDash.Range("CorrMatrixStart").Row + 1
+    wsDash.Range(wsDash.Cells(corrR, wsDash.Range("CorrMatrixStart").Column), wsDash.Cells(corrR + 50, 50)).ClearContents
+    corrR = wsDash.Range("StrategyWeightsStart").Row + 1
+    wsDash.Range(wsDash.Cells(corrR - 1, wsDash.Range("StrategyWeightsStart").Column + 1), wsDash.Cells(corrR - 1, wsDash.Range("CorrMatrixStart").Column)).ClearContents
+    wsDash.Range(wsDash.Cells(corrR, wsDash.Range("StrategyWeightsStart").Column), wsDash.Cells(corrR + 50, 8)).ClearContents
+    Sheets(CHART_SHEET).Cells.ClearContents
+    Sheets(WEIGHTS_SHEET).Cells.ClearContents
+End Sub
+
+
+
+
+
+
+
+
+
+
+
+
+-------------------------------------------------------------------------------
+VBA MACRO chartsUtils.bas
+in file: xl/vbaProject.bin - OLE stream: 'VBA/chartsUtils'
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Option Explicit
+Option Base 1
+
+Private Const CHART_SHEET As String = "ChartData"
+Private Const DASH_SHEET As String = "Dashboard"
+
+
+
+Sub UpdateDashboardCharts(nAssets As Integer, nStrats As Integer, lastDate As Date)
+    Dim wsDash As Worksheet, wsChart As Worksheet
+    Set wsDash = Sheets(DASH_SHEET)
+    Set wsChart = Sheets(CHART_SHEET)
+
+    Dim lastRow As Long
+    lastRow = wsChart.Cells(wsChart.Rows.count, 1).End(xlUp).Row
+    If lastRow < 2 Then lastRow = 2
+
+    Dim xRange As Range
+    Set xRange = wsChart.Range(wsChart.Cells(2, 1), wsChart.Cells(lastRow, 1))
+
+    Dim chtObj As ChartObject
+    For Each chtObj In wsDash.ChartObjects
+        Dim title As String
+        On Error Resume Next
+        title = chtObj.Chart.ChartTitle.Text
+        On Error GoTo 0
+
+        Dim startCol As Integer, count As Integer
+        Dim isPerf As Boolean
+        isPerf = False
+
+        If title = "Assets Cumulative Returns" Then
+            startCol = 2
+            count = nAssets
+            isPerf = True
+        ElseIf title = "Strategies Cumulative Returns" Then
+            startCol = nAssets + 2
+            count = nStrats
+            isPerf = True
+        ElseIf title = "Strategies Drawdowns" Then
+            startCol = nAssets + 2 + nStrats
+            count = nStrats
+            isPerf = False
+        Else
+            startCol = 0
+        End If
+
+        If startCol > 0 Then
+            UpdateSingleChartSeries chtObj.Chart, xRange, wsChart, startCol, count
+
+            Dim totalMonths As Long
+            ' Calcul de la durée en mois entre le début et la fin
+
+
+            With chtObj.Chart.Axes(xlCategory)
+            totalMonths = DateDiff("m", .MinimumScale, .MaximumScale)
+                .CategoryType = xlTimeScale
+                .TickLabels.NumberFormat = "mmm yy"
+                .MaximumScale = lastDate
+                ' Ajustement dynamique de l'unité majeure
+                Select Case totalMonths
+                    Case Is <= 12
+                        .MajorUnitScale = xlMonths
+                        .MajorUnit = 1        ' Un label par mois
+                    Case 13 To 24
+                        .MajorUnitScale = xlMonths
+                        .MajorUnit = 3        ' Un label tous les trimestres
+                    Case 25 To 48
+                        .MajorUnitScale = xlMonths
+                        .MajorUnit = 6        ' Un label tous les semestres
+                    Case Else
+                        .MajorUnitScale = xlYears
+                        .MajorUnit = 1        ' Un label par an
+                End Select
+            End With
+
+            If isPerf Then
+                Dim dRange As Range
+                Set dRange = wsChart.Range(wsChart.Cells(2, startCol), wsChart.Cells(lastRow, startCol + count - 1))
+                Dim minVal As Double, maxVal As Double
+                minVal = Application.WorksheetFunction.Min(dRange)
+                maxVal = Application.WorksheetFunction.Max(dRange)
+                Dim rangeVal As Double
+                rangeVal = maxVal - minVal
+                If rangeVal = 0 Then rangeVal = 10
+                Dim axisMin As Double, axisMax As Double
+                axisMin = minVal - (rangeVal * 0.05)
+                axisMax = maxVal + (rangeVal * 0.05)
+                With chtObj.Chart.Axes(xlValue)
+                    .MinimumScale = axisMin
+                    .MaximumScale = axisMax
+                    .TickLabels.NumberFormat = "0"
+                End With
+            Else
+                Dim ddRange As Range
+                Set ddRange = wsChart.Range(wsChart.Cells(2, startCol), wsChart.Cells(lastRow, startCol + count - 1))
+                Dim minDD As Double
+                minDD = Application.WorksheetFunction.Min(ddRange)
+                With chtObj.Chart.Axes(xlValue)
+                    .MaximumScale = 0
+                    .MinimumScale = minDD * 1.1
+                    .TickLabels.NumberFormat = "0%"
+                End With
+            End If
+        End If
+    Next chtObj
+End Sub
+
+
+Sub UpdateSingleChartSeries(cht As Chart, xRange As Range, wsData As Worksheet, startCol As Integer, count As Integer)
+    Dim s As Series
+    Do While cht.SeriesCollection.count > 0
+        cht.SeriesCollection(1).Delete
+    Loop
+    Dim i As Integer
+    For i = 0 To count - 1
+        Dim colIdx As Integer
+        colIdx = startCol + i
+        Set s = cht.SeriesCollection.NewSeries
+        s.XValues = xRange
+        s.Values = wsData.Range(wsData.Cells(2, colIdx), wsData.Cells(xRange.Rows.count + 1, colIdx))
+        s.Name = wsData.Cells(1, colIdx).Value
+        s.Format.Line.Weight = 1.25
+    Next i
+    With cht.Legend
+        .Position = xlLegendPositionTop
+        .IncludeInLayout = True
+        .Top = cht.ChartTitle.Top + cht.ChartTitle.Height + 5
+    End With
+End Sub
+-------------------------------------------------------------------------------
+VBA MACRO portfolioUtils.bas
+in file: xl/vbaProject.bin - OLE stream: 'VBA/portfolioUtils'
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Option Explicit
+Option Base 1
+
+Private Const DASH_SHEET As String = "Dashboard"
+Private Const WEIGHTS_SHEET As String = "SimulatedWeights"
+Private Const RISK_FREE_ROW As Integer = 4
+
+
+Sub SimulatePortfolio(prices As Variant, dates As Variant, w As Variant, _
+                      ByRef outCurve() As Double, ByRef outWeights() As Double, ByRef outDD() As Double, _
+                      ByRef mRet As Double, ByRef mVol As Double, ByRef mSharpe As Double, _
+                      ByRef mMDD As Double, ByRef mLen As Integer, ByRef mVaR As Double)
+    Dim nDays As Long, nAssets As Long
+    Dim i As Long, j As Long
+    nDays = UBound(prices, 1)
+    nAssets = UBound(prices, 2)
+    ReDim outCurve(1 To nDays, 1 To 1)
+    outCurve(1, 1) = 100
+    ReDim outWeights(1 To nDays, 1 To nAssets)
+    ReDim outDD(1 To nDays, 1 To 1)
+    Dim currentVal As Double
+    currentVal = 100
+    Dim shares() As Double
+    ReDim shares(1 To nAssets)
+    For j = 1 To nAssets
+        shares(j) = (currentVal * w(1, j)) / prices(1, j)
+        outWeights(1, j) = w(1, j)
+    Next j
+    Dim logRets() As Double
+    ReDim logRets(1 To nDays - 1)
+    Dim peak As Double
+    peak = 100
+    For i = 2 To nDays
+        Dim dPrev As Date, dCurr As Date
+        dPrev = dates(i - 1)
+        dCurr = dates(i)
+        Dim prevTotal As Double
+        prevTotal = outCurve(i - 1, 1)
+        If Month(dCurr) <> Month(dPrev) Then
+            For j = 1 To nAssets
+                shares(j) = (prevTotal * w(1, j)) / prices(i, j)
+            Next j
+        End If
+        Dim assetVal As Double
+        assetVal = 0
+        For j = 1 To nAssets
+            assetVal = assetVal + shares(j) * prices(i, j)
+        Next j
+        outCurve(i, 1) = assetVal
+        If assetVal > peak Then
+            peak = assetVal
+            outDD(i, 1) = 0
+        Else
+            outDD(i, 1) = (assetVal / peak) - 1
+        End If
+        For j = 1 To nAssets
+            If assetVal > 0 Then
+                outWeights(i, j) = (shares(j) * prices(i, j)) / assetVal
+            Else
+                outWeights(i, j) = 0
+            End If
+        Next j
+        logRets(i - 1) = Log(outCurve(i, 1) / outCurve(i - 1, 1))
+    Next i
+    Dim totalRet As Double
+    totalRet = outCurve(nDays, 1) / 100
+    mRet = (totalRet ^ (256 / (nDays - 1))) - 1
+    Dim sumSq As Double, meanL As Double
+    Dim s As Double
+    s = 0
+    For i = 1 To nDays - 1
+        s = s + logRets(i)
+    Next i
+    meanL = s / (nDays - 1)
+    sumSq = 0
+    For i = 1 To nDays - 1
+        sumSq = sumSq + (logRets(i) - meanL) ^ 2
+    Next i
+    mVol = Sqr(sumSq / (nDays - 2)) * Sqr(256)
+    Dim rf As Double
+    rf = Sheets(DASH_SHEET).Range("C" & RISK_FREE_ROW).Value
+    mSharpe = (mRet - rf) / mVol
+    Call CalculateDrawdownFromCurve(outCurve, mMDD, mLen)
+    Dim conf As Double, Z As Double
+    conf = Sheets(DASH_SHEET).Range("C5").Value
+    Z = Application.NormSInv(conf)
+    mVaR = mRet - Z * mVol
+End Sub
+
+Sub CalculateDrawdownFromCurve(curve As Variant, ByRef outMDD As Double, ByRef outLen As Integer)
+    Dim n As Long, i As Long
+    n = UBound(curve, 1)
+    Dim peak As Double, dd As Double, maxDD As Double
+    Dim peakDay As Long, currLen As Integer, maxLen As Integer
+    peak = -99999
+    maxDD = 0: maxLen = 0: currLen = 0
+    For i = 1 To n
+        Dim val As Double
+        val = curve(i, 1)
+        If val > peak Then
+            peak = val
+            peakDay = i
+            currLen = 0
+        Else
+            dd = (val / peak) - 1
+            currLen = i - peakDay
+            If dd < maxDD Then maxDD = dd
+            If currLen > maxLen Then maxLen = currLen
+        End If
+    Next i
+    outMDD = maxDD
+    outLen = maxLen
+End Sub
+
+Sub OutputMetricsToRow(rowOffset As Integer, TypeStr As String, mRet, mVol, mSharpe, mMDD, mLen, mVaR, w, RangeName As String, WriteWeights As Boolean)
+    Dim ws As Worksheet
+    Set ws = Sheets(DASH_SHEET)
+    Dim startRow As Long, startCol As Long
+    startRow = ws.Range(RangeName).Row + 1
+    startCol = ws.Range(RangeName).Column
+
+    Dim r As Integer
+    r = startRow + rowOffset
+    If RangeName = "AssetMetricsStart" Then
+        startCol = startCol - 1
+    Else
+        ws.Cells(r, startCol).Value = TypeStr
+    End If
+
+    ws.Cells(r, startCol + 1).Value = mRet
+    ws.Cells(r, startCol + 2).Value = mVol
+    ws.Cells(r, startCol + 3).Value = mSharpe
+    ws.Cells(r, startCol + 4).Value = mMDD
+    ws.Cells(r, startCol + 5).Value = mLen
+    ws.Cells(r, startCol + 6).Value = mVaR
+
+    If WriteWeights Then
+        startRow = ws.Range("StrategyWeightsStart").Row
+        startCol = ws.Range("StrategyWeightsStart").Column + 1 + rowOffset
+
+        ws.Cells(startRow, startCol).Value = TypeStr
+
+        Dim i As Integer, nCols As Integer
+        nCols = UBound(w, 2)
+
+        For i = 1 To nCols
+            ws.Cells(startRow + i, startCol).Value = w(1, i)
+        Next i
+    End If
+End Sub
+
+-------------------------------------------------------------------------------
+VBA MACRO solverUtils.bas
+in file: xl/vbaProject.bin - OLE stream: 'VBA/solverUtils'
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Option Explicit
+Option Base 1
+
+Private Const DASH_SHEET As String = "Dashboard"
+Private Const ENGINE_SHEET As String = "Engine"
+Private Const RISK_FREE_ROW As Integer = 4
+
+Sub WriteToEngine(covMat() As Double, expReturns() As Double)
+    Dim wsEng As Worksheet
+    Dim nAssets As Long
+    Dim i As Long, j As Long
+    Set wsEng = Sheets(ENGINE_SHEET)
+    nAssets = UBound(expReturns)
+    wsEng.Cells.Clear
+    wsEng.Range("A1").Value = "Expected Returns"
+    wsEng.Range(wsEng.Cells(2, 1), wsEng.Cells(2, nAssets)).Value = expReturns
+    wsEng.Range(wsEng.Cells(2, 1), wsEng.Cells(2, nAssets)).Name = "ExpReturns"
+    wsEng.Range("A5").Value = "Covariance Matrix"
+    wsEng.Range(wsEng.Cells(6, 1), wsEng.Cells(6 + nAssets - 1, nAssets)).Value = covMat
+    wsEng.Range(wsEng.Cells(6, 1), wsEng.Cells(6 + nAssets - 1, nAssets)).Name = "CovMatrix"
+    Dim solverRow As Long
+    solverRow = 6 + nAssets + 5
+    Call SetupOptimizationFormulas(wsEng, nAssets, solverRow)
+End Sub
+
+' ---------------------------------------------------------
+' 1. SETUP: Added Log Calculation Rows for the "Log Trick"
+' ---------------------------------------------------------
+Sub SetupOptimizationFormulas(wsEng As Worksheet, nTotal As Long, startRow As Long)
+    wsEng.Cells(startRow - 1, 1).Value = "Weights (Solver)"
+    Dim i As Long
+    ' Initialize with Equal Weights (Safe starting point for Log)
+    For i = 1 To nTotal
+        wsEng.Cells(startRow, i).Value = 1 / nTotal
+    Next i
+    wsEng.Range(wsEng.Cells(startRow, 1), wsEng.Cells(startRow, nTotal)).Name = "OptWeights"
+
+    Dim rf As Double
+    rf = Sheets(DASH_SHEET).Range("C" & RISK_FREE_ROW).Value
+
+    Dim fRow As Long
+    fRow = startRow + 2
+
+    ' Standard Portfolio Calcs
+    wsEng.Cells(fRow, 1).Value = "Port Return"
+    wsEng.Cells(fRow, 2).Formula = "=SUMPRODUCT(OptWeights, ExpReturns)"
+    wsEng.Cells(fRow, 2).Name = "PortRet"
+
+    wsEng.Cells(fRow + 1, 1).Value = "Port Variance"
+    wsEng.Cells(fRow + 1, 2).FormulaArray = "=MMULT(OptWeights, MMULT(CovMatrix, TRANSPOSE(OptWeights)))"
+    wsEng.Cells(fRow + 1, 2).Name = "PortVar"
+
+    wsEng.Cells(fRow + 2, 1).Value = "Port Vol"
+    wsEng.Cells(fRow + 2, 2).Formula = "=SQRT(PortVar)"
+    wsEng.Cells(fRow + 2, 2).Name = "PortVol"
+
+    wsEng.Cells(fRow + 3, 1).Value = "Sharpe"
+    wsEng.Cells(fRow + 3, 2).Formula = "=(PortRet - " & rf & ")/PortVol"
+    wsEng.Cells(fRow + 3, 2).Name = "PortSharpe"
+
+    wsEng.Cells(fRow + 4, 1).Value = "Kelly"
+    wsEng.Cells(fRow + 4, 2).Formula = "=PortRet - (PortVar/2)"
+    wsEng.Cells(fRow + 4, 2).Name = "PortKelly"
+
+    wsEng.Cells(fRow + 5, 1).Value = "Sum Weights"
+    wsEng.Cells(fRow + 5, 2).Formula = "=SUM(OptWeights)"
+    wsEng.Cells(fRow + 5, 2).Name = "SumWeights"
+
+    ' --- NEW: ERC UNCSTRD Log-Barrier Setup ---
+    Dim logRow As Long
+    logRow = fRow + 7
+    wsEng.Cells(logRow, 1).Value = "Log Weights"
+    Dim wRange As Range
+    Set wRange = wsEng.Range("OptWeights")
+    For i = 1 To nTotal
+        wsEng.Cells(logRow, 1 + i).Formula = "=LN(MAX(" & wRange.Cells(1, i).Address & ", 0.00001))"
+    Next i
+    wsEng.Cells(logRow + 1, 1).Value = "Sum Logs"
+    wsEng.Cells(logRow + 1, 2).Formula = "=SUM(" & wsEng.Range(wsEng.Cells(logRow, 2), wsEng.Cells(logRow, 1 + nTotal)).Address & ")"
+    wsEng.Cells(logRow + 1, 2).Name = "SumLogWeights"
+
+    ' Visualization of Risk Contributions (Optional, for checking result)
+    Dim rcRow As Long
+    rcRow = logRow + 3
+    wsEng.Cells(rcRow, 1).Value = "Risk Contribs Check"
+    wsEng.Range(wsEng.Cells(rcRow, 2), wsEng.Cells(rcRow, 1 + nTotal)).FormulaArray = _
+        "=OptWeights * TRANSPOSE(MMULT(CovMatrix, TRANSPOSE(OptWeights)))"
+
+End Sub
+
+' ---------------------------------------------------------
+' 2. SOLVER: Implemented High Precision & Log Logic
+' ---------------------------------------------------------
+Sub RunSolver(Mode As String, minWeights() As Double, maxWeights() As Double, Optional ShowMsg As Boolean = True)
+    Dim wsEng As Worksheet
+    Set wsEng = Sheets(ENGINE_SHEET)
+    Dim nAssets As Integer
+    nAssets = UBound(maxWeights)
+
+    SolverReset
+    SolverOptions Precision:=0.00000001, Convergence:=0.00000001, Derivatives:=2, IntTolerance:=0, AssumeNonNeg:=True, StepThru:=False
+
+    Dim optRange As Range
+    Set optRange = wsEng.Range("OptWeights")
+    Dim i As Integer
+
+    Dim eqW As Double
+    eqW = 1 / nAssets
+    For i = 1 To nAssets
+        optRange.Cells(1, i).Value = eqW
+    Next i
+
+    If Mode = "ERC UNCSTRD" Then
+        ' --- STRATÉGIE DUAL CONVEXE (La plus robuste) ---
+        ' On cherche à Maximiser la Diversification (Sum Logs) pour un budget de risque donné.
+        SolverOk SetCell:="SumLogWeights", MaxMinVal:=1, ValueOf:=0, ByChange:="OptWeights", Engine:=1
+        SolverAdd CellRef:="PortVar", Relation:=1, FormulaText:="1"
+        SolverAdd CellRef:="OptWeights", Relation:=3, FormulaText:="0.001"
+
+    Else
+        ' --- STRATÉGIES CLASSIQUES (Sharpe, Variance, Kelly) ---
+        SolverAdd CellRef:="SumWeights", Relation:=2, FormulaText:="1"
+        For i = 1 To nAssets
+            SolverAdd CellRef:=optRange.Cells(1, i).Address, Relation:=1, FormulaText:=CStr(maxWeights(i))
+            SolverAdd CellRef:=optRange.Cells(1, i).Address, Relation:=3, FormulaText:=CStr(minWeights(i))
+        Next i
+        Select Case Mode
+            Case "SHARPE": SolverOk SetCell:="PortSharpe", MaxMinVal:=1, ValueOf:=0, ByChange:="OptWeights", Engine:=1
+            Case "MIN VAR": SolverOk SetCell:="PortVar", MaxMinVal:=2, ValueOf:=0, ByChange:="OptWeights", Engine:=1
+            Case "KELLY": SolverOk SetCell:="PortKelly", MaxMinVal:=1, ValueOf:=0, ByChange:="OptWeights", Engine:=1
+        End Select
+    End If
+
+    ' Exécution
+    On Error Resume Next
+    Dim res As Integer
+    res = SolverSolve(True)
+    On Error GoTo 0
+
+    ' --- NORMALISATION FINALE POUR ERC UNCSTRD ---
+    If Mode = "ERC UNCSTRD" And res <= 2 Then
+        Dim currentSum As Double
+        currentSum = Application.WorksheetFunction.Sum(optRange)
+
+        If currentSum <> 0 Then
+            Dim finalWeights() As Variant
+            ReDim finalWeights(1 To nAssets)
+            For i = 1 To nAssets
+                finalWeights(i) = optRange.Cells(1, i).Value / currentSum
+            Next i
+            optRange.Value = finalWeights
+        End If
+    End If
+
+    ' Gestion d'erreur
+    If res > 2 Then
+        For i = 1 To nAssets
+            optRange.Cells(1, i).Value = 1 / nAssets
+        Next i
+        MsgBox Mode & " - Échec de convergence. Retour aux poids égaux.", vbExclamation
+    ElseIf ShowMsg Then
+        MsgBox "Optimisation terminée (" & Mode & ")", vbInformation
+    End If
+
+End Sub
+-------------------------------------------------------------------------------
+VBA MACRO assetUtils.bas
+in file: xl/vbaProject.bin - OLE stream: 'VBA/assetUtils'
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+Option Explicit
+Option Base 1
+
+Private Const DASH_SHEET As String = "Dashboard"
+Private Const PRICE_SHEET As String = "PriceHistory"
+Private Const CHART_SHEET As String = "ChartData"
+Private Const WEIGHTS_SHEET As String = "SimulatedWeights"
+Private Const ENGINE_SHEET As String = "Engine"
+Private Const RISK_FREE_ROW As Integer = 4
+
+Sub GetHistoricalDataDatesAndNames(ByRef outPrices As Variant, ByRef outDates() As Date, ByRef outNames() As String)
+    Dim wsHist As Worksheet
+    Dim lastRow As Long, lastCol As Long
+    Set wsHist = Sheets(PRICE_SHEET)
+    lastRow = wsHist.Cells(wsHist.Rows.count, 1).End(xlUp).Row
+    lastCol = wsHist.Cells(1, wsHist.Columns.count).End(xlToLeft).Column
+    outPrices = wsHist.Range(wsHist.Cells(2, 2), wsHist.Cells(lastRow, lastCol)).Value
+    Dim nAssets As Integer, nDays As Integer
+    nAssets = lastCol - 1
+    nDays = lastRow - 1
+    ReDim outNames(1 To nAssets)
+    Dim i As Integer
+    For i = 1 To nAssets
+        outNames(i) = wsHist.Cells(1, 1 + i).Value
+    Next i
+    ReDim outDates(1 To nDays)
+    For i = 1 To nDays
+        outDates(i) = wsHist.Cells(1 + i, 1).Value
+    Next i
+End Sub
+
+Sub CalculateHistoricalStats(dates As Variant, prices As Variant, ByRef outLogRets() As Double, ByRef outMeanRets() As Double)
+    Dim nDays As Long, nAssets As Long
+    Dim i As Long, j As Long
+    nDays = UBound(prices, 1)
+    nAssets = UBound(prices, 2)
+    ReDim outLogRets(1 To nDays - 1, 1 To nAssets)
+    ReDim outMeanRets(1 To nAssets)
+    For j = 1 To nAssets
+        Dim sumLogRet As Double
+        sumLogRet = 0
+        For i = 2 To nDays
+            Dim pNow As Double, pPrev As Double
+            pNow = prices(i, j)
+            pPrev = prices(i - 1, j)
+            If pPrev > 0 And pNow > 0 Then
+                outLogRets(i - 1, j) = Log(pNow / pPrev)
+                sumLogRet = sumLogRet + outLogRets(i - 1, j)
+            Else
+                outLogRets(i - 1, j) = 0
+            End If
+        Next i
+        outMeanRets(j) = sumLogRet / (dates(nDays) - dates(1)) * 365
+    Next j
+End Sub
+
+Function CalculateCovariance(logRets() As Double, meanRets() As Double) As Double()
+    Dim nDays As Long, nAssets As Long
+    Dim i As Long, j As Long, k As Long
+    Dim res() As Double
+    nDays = UBound(logRets, 1) + 1
+    nAssets = UBound(logRets, 2)
+    ReDim res(1 To nAssets, 1 To nAssets)
+    For j = 1 To nAssets
+        For k = 1 To nAssets
+            Dim sumProd As Double, meanJ As Double, meanK As Double
+            sumProd = 0
+            meanJ = meanRets(j) / 256
+            meanK = meanRets(k) / 256
+            For i = 1 To nDays - 1
+                sumProd = sumProd + (logRets(i, j) - meanJ) * (logRets(i, k) - meanK)
+            Next i
+            res(j, k) = (sumProd / (nDays - 1)) * 256
+        Next k
+    Next j
+    CalculateCovariance = res
+End Function
+
+Function CalculateExpectedReturns(histMeanRets() As Double, currDate As Date) As Double()
+    Dim wsDash As Worksheet
+    Dim nAssets As Long, i As Long
+    Dim res() As Double
+    Set wsDash = Sheets(DASH_SHEET)
+    nAssets = UBound(histMeanRets)
+    ReDim res(1 To nAssets)
+    Dim inputStart As Long
+    inputStart = wsDash.Range("InputTableStart").Row + 1
+    For i = 1 To nAssets
+        Dim rIdx As Integer
+        rIdx = inputStart + i - 1
+        Dim pCurr As Double, pTgt As Double, wTgt As Double
+        Dim pStop As Double, wStop As Double
+        Dim targetDate As Date
+        pCurr = wsDash.Cells(rIdx, 4).Value
+        pTgt = wsDash.Cells(rIdx, 5).Value
+        wTgt = wsDash.Cells(rIdx, 6).Value
+        pStop = wsDash.Cells(rIdx, 7).Value
+        wStop = wsDash.Cells(rIdx, 8).Value
+        targetDate = wsDash.Cells(rIdx, 9).Value
+        Dim T_years As Double
+        If targetDate > currDate Then
+            T_years = (targetDate - currDate) / 365
+        Else
+            T_years = 1
+        End If
+        Dim termTgt As Double, termStop As Double, termHist As Double
+        termTgt = pTgt * wTgt
+        termStop = pStop * wStop
+        termHist = pCurr * (Exp(histMeanRets(i)) ^ T_years) * (1 - wTgt - wStop)
+        Dim eFinal As Double
+        eFinal = termTgt + termStop + termHist
+        If pCurr > 0 And T_years > 0 Then
+            res(i) = (eFinal / pCurr) ^ (1 / T_years) - 1
+        Else
+            res(i) = 0
+        End If
+    Next i
+    CalculateExpectedReturns = res
+End Function
+
+
+
+Sub OutputCorrelationMatrix(covMat() As Double, assetNames() As String)
+    Dim n As Integer
+    n = UBound(covMat, 1)
+    Dim i As Integer, j As Integer
+    Dim wsDash As Worksheet
+    Set wsDash = Sheets(DASH_SHEET)
+    Dim startR As Long, startC As Integer
+    startR = wsDash.Range("CorrMatrixStart").Row + 1
+    startC = wsDash.Range("CorrMatrixStart").Column
+    For i = 1 To n
+        wsDash.Cells(startR, startC + i).Value = assetNames(i)
+        wsDash.Cells(startR + i, startC).Value = assetNames(i)
+    Next i
+    For i = 1 To n
+        For j = 1 To n
+            Dim stdI As Double, stdJ As Double
+            If i = j Then
+                wsDash.Cells(startR + i, startC + j).Value = "-"
+            Else
+                stdI = Sqr(covMat(i, i))
+                stdJ = Sqr(covMat(j, j))
+                If stdI * stdJ > 0 Then
+                    wsDash.Cells(startR + i, startC + j).Value = covMat(i, j) / (stdI * stdJ)
+                Else
+                    wsDash.Cells(startR + i, startC + j).Value = 0
+                End If
+            End If
+        Next j
+    Next i
+End Sub
+
+Sub DrawEfficientFrontier(nAssets As Integer, maxWeights() As Double)
+    Dim wsEng As Worksheet
+    Set wsEng = Sheets(ENGINE_SHEET)
+    Dim expRets As Variant
+    expRets = wsEng.Range("ExpReturns").Value
+    Dim minR As Double, maxR As Double
+    minR = 9999: maxR = -9999
+    Dim i As Integer
+    For i = 1 To nAssets
+        Dim r As Double
+        r = expRets(1, i)
+        If r < minR Then minR = r
+        If r > maxR Then maxR = r
+    Next i
+    Dim nPoints As Integer
+    nPoints = 10
+    Dim stepR As Double
+    stepR = (maxR - minR) / (nPoints - 1)
+    Dim wsChart As Worksheet
+    Set wsChart = Sheets(CHART_SHEET)
+    Dim startCol As Integer
+    startCol = 100
+    wsChart.Range(wsChart.Cells(2, startCol), wsChart.Cells(100, startCol + 1)).ClearContents
+    SolverReset
+    SolverAdd CellRef:="SumWeights", Relation:=2, FormulaText:="1"
+    SolverAdd CellRef:="OptWeights", Relation:=3, FormulaText:="0"
+    Dim optRange As Range
+    Set optRange = wsEng.Range("OptWeights")
+    Dim j As Integer
+    For j = 1 To nAssets
+        SolverAdd CellRef:=optRange.Cells(1, j).Address, Relation:=1, FormulaText:=CStr(maxWeights(j))
+    Next j
+    For i = 1 To nPoints
+        Dim targetR As Double
+        targetR = minR + (i - 1) * stepR
+        SolverOk SetCell:="PortVar", MaxMinVal:=2, ValueOf:=0, ByChange:="OptWeights", Engine:=1
+        SolverAdd CellRef:="PortRet", Relation:=3, FormulaText:=CStr(targetR)
+        On Error Resume Next
+        SolverSolve True
+        On Error GoTo 0
+        Dim vol As Double, ret As Double
+        vol = wsEng.Range("PortVol").Value
+        ret = wsEng.Range("PortRet").Value
+        wsChart.Cells(1 + i, startCol).Value = vol
+        wsChart.Cells(1 + i, startCol + 1).Value = ret
+    Next i
+End Sub
+
+Sub UpdateCurrentPrices(prices As Variant)
+    Dim wsDash As Worksheet
+    Set wsDash = Sheets(DASH_SHEET)
+    Dim inputStart As Long
+    inputStart = wsDash.Range("InputTableStart").Row + 1
+    Dim nDays As Long, nAssets As Long
+    nDays = UBound(prices, 1)
+    nAssets = UBound(prices, 2)
+    Dim i As Integer
+    For i = 1 To nAssets
+        wsDash.Cells(inputStart + i - 1, 4).Value = prices(nDays, i)
+    Next i
+End Sub
+
+
+Sub WriteCurveToSheet(curve As Variant, colIdx As Integer)
+    Dim ws As Worksheet
+    Set ws = Sheets(CHART_SHEET)
+    Dim n As Long
+    n = UBound(curve, 1)
+    ws.Range(ws.Cells(2, colIdx), ws.Cells(2 + n - 1, colIdx)).Value = curve
+End Sub
+
+Sub WriteWeightsToSheet(wArray As Variant, startCol As Integer)
+    Dim ws As Worksheet
+    Set ws = Sheets(WEIGHTS_SHEET)
+    Dim nRows As Long, nCols As Long
+    nRows = UBound(wArray, 1)
+    nCols = UBound(wArray, 2)
+    ws.Range(ws.Cells(2, startCol), ws.Cells(2 + nRows - 1, startCol + nCols - 1)).Value = wArray
+End Sub
+
+Sub SyncSimWeightsHeaders(dates() As Date, assetNames() As String, strategies As Variant)
+    Dim wsSim As Worksheet
+    Set wsSim = Sheets(WEIGHTS_SHEET)
+    wsSim.Rows(1).ClearContents
+    wsSim.Cells(1, 1).Value = "Date"
+    Dim nAssets As Integer, nDays As Integer
+    nAssets = UBound(assetNames)
+    nDays = UBound(dates)
+    Dim i As Integer, j As Integer
+    Dim colIdx As Integer
+    colIdx = 2
+    For i = LBound(strategies) To UBound(strategies)
+        For j = 1 To nAssets
+            wsSim.Cells(1, colIdx).Value = strategies(i) & "_" & assetNames(j)
+            colIdx = colIdx + 1
+        Next j
+    Next i
+    For i = 1 To nDays
+        wsSim.Cells(1 + i, 1).Value = dates(i)
+    Next i
+End Sub
+
+Sub ProcessIndividualAssets(prices As Variant, dates As Variant, logRets As Variant, assetNames() As String)
+    Dim nDays As Long, nAssets As Long
+    Dim i As Long, j As Long
+    nDays = UBound(prices, 1)
+    nAssets = UBound(prices, 2)
+    Dim wsChart As Worksheet
+    Set wsChart = Sheets(CHART_SHEET)
+    For j = 1 To nAssets
+        Dim curve() As Double
+        ReDim curve(1 To nDays, 1 To 1)
+        Dim startP As Double
+        startP = prices(1, j)
+        For i = 1 To nDays
+            curve(i, 1) = (prices(i, j) / startP) * 100
+        Next i
+        wsChart.Range(wsChart.Cells(2, 1 + j), wsChart.Cells(2 + nDays - 1, 1 + j)).Value = curve
+        Dim mRet As Double, mVol As Double, mSharpe As Double, mMDD As Double, mLen As Integer, mVaR As Double
+        Dim totalRet As Double
+        totalRet = prices(nDays, j) / prices(1, j)
+        mRet = totalRet ^ (365 / (dates(nDays) - dates(1))) - 1
+        Dim sumSq As Double, meanL As Double
+        Dim s As Double
+        s = 0
+        sumSq = 0
+        For i = 1 To nDays - 1
+             s = s + logRets(i, j)
+        Next i
+        meanL = s / (nDays - 1)
+        For i = 1 To nDays - 1
+            sumSq = sumSq + (logRets(i, j) - meanL) ^ 2
+        Next i
+        mVol = Sqr(sumSq / (nDays - 2)) * Sqr(256)
+        Dim rf As Double
+        rf = Sheets(DASH_SHEET).Range("C" & RISK_FREE_ROW).Value
+        mSharpe = (mRet - rf) / mVol
+        Call CalculateDrawdownFromCurve(curve, mMDD, mLen)
+        Dim conf As Double, Z As Double
+        conf = Sheets(DASH_SHEET).Range("C5").Value
+        Z = Application.NormSInv(conf)
+        mVaR = mRet - Z * mVol
+        Dim dummyW As Variant
+        Call OutputMetricsToRow(j - 1, assetNames(j), mRet, mVol, mSharpe, mMDD, mLen, mVaR, dummyW, "AssetMetricsStart", False)
+    Next j
+End Sub
+
+Sub SyncDashboardHeaders(dates() As Date, assetNames() As String, strategies As Variant)
+    Dim wsDash As Worksheet
+    Set wsDash = Sheets(DASH_SHEET)
+    Dim nAssets As Integer, nDates As Integer
+    nAssets = UBound(assetNames)
+    nDates = UBound(dates)
+    Dim i As Integer
+    Dim inputStart As Long, inputStartCol As Integer
+    inputStart = wsDash.Range("InputTableStart").Row + 1
+    For i = 1 To nAssets
+        wsDash.Cells(inputStart + i - 1, 2).Value = assetNames(i)
+        wsDash.Cells(inputStart + i - 1, 3).Value = 1 / nAssets
+    Next i
+    inputStart = wsDash.Range("StrategyWeightsStart").Row + 1
+    inputStartCol = wsDash.Range("StrategyWeightsStart").Column
+    For i = 1 To nAssets
+        wsDash.Cells(inputStart + i - 1, 2).Value = assetNames(i)
+    Next i
+
+    Dim nStrat As Integer
+    nStrat = UBound(strategies) - LBound(strategies) + 1
+    For i = 1 To nStrat
+        wsDash.Cells(inputStart - 1, inputStartCol + i).Value = CStr(strategies(i))
+    Next i
+    Dim stratStart As Long, stratCol As Long
+    stratStart = wsDash.Range("StrategyTableStart").Row
+    stratCol = wsDash.Range("StrategyTableStart").Column
+    wsDash.Range(wsDash.Cells(stratStart, stratCol + 7), wsDash.Cells(stratStart, stratCol + 100)).ClearContents
+
+    Dim wsChart As Worksheet
+    Set wsChart = Sheets(CHART_SHEET)
+    wsChart.Rows(1).ClearContents
+    wsChart.Cells(1, 1).Value = "Date"
+    For i = 1 To nAssets
+        wsChart.Cells(1, 1 + i).Value = assetNames(i)
+    Next i
+
+    For i = 1 To nStrat
+        wsChart.Cells(1, 1 + nAssets + i).Value = CStr(strategies(i))
+    Next i
+    For i = 1 To nDates
+        wsChart.Cells(1 + i, 1).Value = dates(i)
+    Next i
+    For i = 1 To nStrat
+        wsChart.Cells(1, 1 + nAssets + nStrat + i).Value = CStr(strategies(i)) & "_DD"
+    Next i
+    wsChart.Cells(1, 100).Value = "Frontier_Vol"
+    wsChart.Cells(1, 101).Value = "Frontier_Ret"
+End Sub
+
+
+
+-------------------------------------------------------------------------------
+VBA MACRO Sheet6.cls
+in file: xl/vbaProject.bin - OLE stream: 'VBA/Sheet6'
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+(empty macro)
+-------------------------------------------------------------------------------
+VBA MACRO Sheet7.cls
+in file: xl/vbaProject.bin - OLE stream: 'VBA/Sheet7'
+- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+(empty macro)
