@@ -46,10 +46,11 @@ def evaluate_strategy(
     deployment_horizon: float,
     performance_horizon: float,
     dt: float,
-    cash_rate: float
+    cash_rate: float,
+    sigma: float
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Evaluate an N-split investment strategy.
+    Evaluate an N-split investment strategy with a price-contingent trigger.
 
     Args:
         price_paths: Array of simulated prices, shape (n_steps + 1, n_sims).
@@ -59,6 +60,7 @@ def evaluate_strategy(
         performance_horizon: Time at which to evaluate final value (e.g., 1.0 years).
         dt: Time step of the simulation.
         cash_rate: Risk-free rate for uninvested cash (annualized, continuous).
+        sigma: Volatility used to calculate the price trigger margin.
 
     Returns:
         Tuple of (shares_acquired, final_portfolio_values).
@@ -73,24 +75,64 @@ def evaluate_strategy(
         final_values = shares_acquired * final_prices
         return shares_acquired, final_values
 
-    # Calculate deployment times
+    # Calculate target dates for the time-based fallback
     # Example: if 2 splits over 0.5 years, deploy at t=0 and t=0.5
     # If 3 splits over 0.5 years, deploy at t=0, t=0.25, t=0.5
     deployment_times = np.linspace(0, deployment_horizon, n_splits)
-    deployment_indices = np.round(deployment_times / dt).astype(int)
+    target_indices = np.round(deployment_times / dt).astype(int)
 
     investment_per_split = total_investment / n_splits
     total_shares = np.zeros(n_sims)
 
-    for t_idx, t_time in zip(deployment_indices, deployment_times):
-        # Calculate how much the cash has grown up to this point
-        # Cash compounding: C(t) = C(0) * exp(r * t)
-        cash_available = investment_per_split * np.exp(cash_rate * t_time)
+    # Track which index in the simulation each path is currently at
+    current_indices = np.zeros(n_sims, dtype=int)
 
-        # Buy shares at the current price
-        current_prices = price_paths[t_idx, :]
-        shares_bought = cash_available / current_prices
-        total_shares += shares_bought
+    # 1. First Allocation at t=0
+    cash_available = investment_per_split * np.exp(cash_rate * 0.0)
+    current_prices = price_paths[0, :]
+    total_shares += cash_available / current_prices
+
+    S0 = price_paths[0, 0] # Initial stock price is the same for all paths
+
+    # Process remaining N-1 allocations
+    for k in range(1, n_splits):
+        target_idx = target_indices[k]
+
+        # Cascading trigger price: drop by k * 0.25 * sigma
+        trigger_margin = k * 0.25 * sigma
+        trigger_price = S0 * max(0.0, 1.0 - trigger_margin) # Prevent negative prices
+
+        # Vectorized approach to find the first time price drops below trigger_price
+        # We only search between current_indices + 1 and target_idx
+
+        # Create a mask for valid search regions
+        # Shape: (target_idx + 1, n_sims)
+        time_steps = np.arange(target_idx + 1)[:, None]
+        valid_search_mask = (time_steps > current_indices) & (time_steps <= target_idx)
+
+        # Mask where prices are below trigger
+        trigger_mask = (price_paths[:target_idx + 1, :] <= trigger_price) & valid_search_mask
+
+        # Find the first index where trigger is hit for each simulation
+        # argmax returns the first index of True. If all are False, it returns 0.
+        first_hit_indices = np.argmax(trigger_mask, axis=0)
+
+        # Determine if a trigger was actually hit
+        hit_trigger = trigger_mask[first_hit_indices, np.arange(n_sims)]
+
+        # Set deploy index: if hit, use first_hit_indices, else use target_idx
+        deploy_indices = np.where(hit_trigger, first_hit_indices, target_idx)
+
+        # Deploy capital
+        deploy_times = deploy_indices * dt
+        cash_available = investment_per_split * np.exp(cash_rate * deploy_times)
+
+        execution_prices = price_paths[deploy_indices, np.arange(n_sims)]
+
+        total_shares += cash_available / execution_prices
+
+        # Update current indices
+        current_indices = deploy_indices
 
     final_prices = price_paths[-1, :]
     final_values = total_shares * final_prices
@@ -135,7 +177,7 @@ def run_simulation_grid():
             for n_splits in splits_to_test:
                 shares, final_values = evaluate_strategy(
                     price_paths, n_splits, total_investment,
-                    deployment_horizon, performance_horizon, dt, cash_rate
+                    deployment_horizon, performance_horizon, dt, cash_rate, sigma
                 )
 
                 # Metric 1: Median Final Value
