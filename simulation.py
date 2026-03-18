@@ -3,14 +3,21 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Tuple
 
-def simulate_gbm(S0: float, mu: float, sigma: float, T: float, dt: float, n_sims: int) -> np.ndarray:
+def simulate_merton_jump_diffusion(
+    S0: float, mu: float, sigma: float,
+    lambda_jump: float, mu_jump: float, sigma_jump: float,
+    T: float, dt: float, n_sims: int
+) -> np.ndarray:
     """
-    Simulate Geometric Brownian Motion paths.
+    Simulate Merton Jump-Diffusion paths.
 
     Args:
         S0: Initial stock price
-        mu: Drift (annualized)
-        sigma: Volatility (annualized)
+        mu: Continuous drift (annualized)
+        sigma: Continuous volatility (annualized)
+        lambda_jump: Expected number of jumps per year
+        mu_jump: Mean log-return of a jump
+        sigma_jump: Standard deviation of a jump
         T: Total time (years)
         dt: Time step
         n_sims: Number of simulations
@@ -19,15 +26,26 @@ def simulate_gbm(S0: float, mu: float, sigma: float, T: float, dt: float, n_sims
         np.ndarray of shape (n_steps + 1, n_sims) containing price paths.
     """
     n_steps = int(T / dt)
-    # Generate standard normal random variables
-    Z = np.random.standard_normal((n_steps, n_sims))
 
-    # Calculate log returns
-    # d(ln S) = (mu - 0.5 * sigma^2) dt + sigma * dW
+    # 1. Continuous GBM Component
+    Z = np.random.standard_normal((n_steps, n_sims))
     drift_term = (mu - 0.5 * sigma**2) * dt
     diffusion_term = sigma * np.sqrt(dt) * Z
 
-    log_returns = drift_term + diffusion_term
+    # 2. Jump Component
+    # Number of jumps in each time step follows a Poisson distribution
+    # Expected jumps in dt = lambda_jump * dt
+    N_jumps = np.random.poisson(lam=lambda_jump * dt, size=(n_steps, n_sims))
+
+    # Sum of jump sizes. If N_jumps = k, we need the sum of k normal random variables
+    # We can approximate this efficiently:
+    # A sum of k identical normals N(mu_j, sigma_j^2) is distributed as N(k*mu_j, k*sigma_j^2)
+    # So, Jump_size = N_jumps * mu_jump + sqrt(N_jumps) * sigma_jump * Z_jump
+    Z_jump = np.random.standard_normal((n_steps, n_sims))
+    jump_term = N_jumps * mu_jump + np.sqrt(N_jumps) * sigma_jump * Z_jump
+
+    # Total log returns
+    log_returns = drift_term + diffusion_term + jump_term
 
     # Prepend zeros for the initial state (t=0)
     log_returns = np.vstack([np.zeros(n_sims), log_returns])
@@ -175,11 +193,14 @@ def run_simulation_grid():
     n_sims = 10000
     cash_rate = 0.03
 
-    # Ranges
+    # Ranges (Continuous)
     # Drift from -10% to +30%
     mu_range = np.linspace(-0.10, 0.30, 41)
     # Volatility from 5% to 50%
     sigma_range = np.linspace(0.05, 0.50, 46)
+
+    # Jump Frequency (Fixed)
+    lambda_jump = 4.0
 
     # Strategies: 1 (Lump Sum), 2, 3, 4, 6 (monthly over 6m)
     splits_to_test = [1, 2, 3, 4, 6]
@@ -188,12 +209,21 @@ def run_simulation_grid():
     results_median = np.zeros((len(mu_range), len(sigma_range)))
     results_shares = np.zeros((len(mu_range), len(sigma_range)))
 
-    print("Starting simulation grid...")
+    print("Starting Merton Jump-Diffusion simulation grid...")
     for i, mu in enumerate(mu_range):
         for j, sigma in enumerate(sigma_range):
+
+            # Jump parameters dynamically scaled to asset volatility
+            mu_jump = -0.25 * sigma    # E.g. at 20% vol, average jump is -5%
+            sigma_jump = 0.25 * sigma  # E.g. at 20% vol, jump volatility is 5%
+
             # Simulate paths for this (mu, sigma) pair
             np.random.seed(42) # For reproducibility and fair comparison across splits
-            price_paths = simulate_gbm(S0, mu, sigma, performance_horizon, dt, n_sims)
+            price_paths = simulate_merton_jump_diffusion(
+                S0, mu, sigma,
+                lambda_jump, mu_jump, sigma_jump,
+                performance_horizon, dt, n_sims
+            )
 
             best_median_split = None
             max_median_value = -np.inf
@@ -245,9 +275,9 @@ def run_simulation_grid():
     ax.set_yticks(mu_ticks + 0.5)
     ax.set_yticklabels([mu_labels[i] for i in mu_ticks])
 
-    plt.title("Optimal Number of Splits to Maximize Median Final Value (1 Yr)")
-    plt.xlabel("Volatility (σ)")
-    plt.ylabel("Drift (μ)")
+    plt.title(f"Optimal Splits for Median Final Value\nAssuming Jumps: λ={lambda_jump}, μ_j=-0.25σ, σ_j=0.25σ")
+    plt.xlabel("Continuous Volatility (σ)")
+    plt.ylabel("Continuous Drift (μ)")
     plt.savefig("heatmap_median_value.png", dpi=300, bbox_inches='tight')
     plt.close()
 
@@ -263,9 +293,9 @@ def run_simulation_grid():
     ax2.set_yticks(mu_ticks + 0.5)
     ax2.set_yticklabels([mu_labels[i] for i in mu_ticks])
 
-    plt.title("Optimal Number of Splits to Maximize Expected Shares Acquired")
-    plt.xlabel("Volatility (σ)")
-    plt.ylabel("Drift (μ)")
+    plt.title(f"Optimal Splits for Expected Shares Acquired\nAssuming Jumps: λ={lambda_jump}, μ_j=-0.25σ, σ_j=0.25σ")
+    plt.xlabel("Continuous Volatility (σ)")
+    plt.ylabel("Continuous Drift (μ)")
     plt.savefig("heatmap_expected_shares.png", dpi=300, bbox_inches='tight')
     plt.close()
 
