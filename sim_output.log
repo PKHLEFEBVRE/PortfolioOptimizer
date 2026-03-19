@@ -1,3 +1,12 @@
-Starting Merton Jump-Diffusion simulation grid...
-Simulation complete. Generating heatmaps...
-Heatmaps saved to 'heatmap_median_value.png' and 'heatmap_expected_shares.png'.
+[*********************100%***********************]  1 of 1 completed
+Downloading historical data for ^GSPC (2000-01-01 to 2025-01-01)...
+
+--- S&P 500 Empirical Crash Calibration (2000-2025) ---
+Threshold Ratios : μ_j/σ = -0.017, σ_j/σ = 0.347
+MLE Ratios       : μ_j/σ = -0.025, σ_j/σ = 0.176
+AVERAGED RATIOS  : μ_j/σ = -0.021, σ_j/σ = 0.261
+AVERAGE FREQ (λ) : 27.00 jumps/year
+------------------------------------------------------
+
+Starting OOP Grid Simulation...
+Generating Heatmaps...

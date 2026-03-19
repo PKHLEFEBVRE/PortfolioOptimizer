@@ -1,305 +1,335 @@
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+import yfinance as yf
+from scipy.optimize import minimize
+import scipy.stats as stats
+import warnings
 from typing import Tuple
 
-def simulate_merton_jump_diffusion(
-    S0: float, mu: float, sigma: float,
-    lambda_jump: float, mu_jump: float, sigma_jump: float,
-    T: float, dt: float, n_sims: int
-) -> np.ndarray:
-    """
-    Simulate Merton Jump-Diffusion paths.
+# Suppress warnings from optimization
+warnings.filterwarnings('ignore')
 
-    Args:
-        S0: Initial stock price
-        mu: Continuous drift (annualized)
-        sigma: Continuous volatility (annualized)
-        lambda_jump: Expected number of jumps per year
-        mu_jump: Mean log-return of a jump
-        sigma_jump: Standard deviation of a jump
-        T: Total time (years)
-        dt: Time step
-        n_sims: Number of simulations
+class SP500Estimator:
+    """Estimates empirical Merton Jump-Diffusion parameters from S&P 500 history."""
 
-    Returns:
-        np.ndarray of shape (n_steps + 1, n_sims) containing price paths.
-    """
-    n_steps = int(T / dt)
+    def __init__(self, start_date="2000-01-01", end_date="2025-01-01", ticker="^GSPC"):
+        self.start_date = start_date
+        self.end_date = end_date
+        self.ticker = ticker
+        self.dt = 1 / 252.0
 
-    # 1. Continuous GBM Component
-    Z = np.random.standard_normal((n_steps, n_sims))
-    drift_term = (mu - 0.5 * sigma**2) * dt
-    diffusion_term = sigma * np.sqrt(dt) * Z
+    def download_data(self) -> np.ndarray:
+        print(f"Downloading historical data for {self.ticker} ({self.start_date} to {self.end_date})...")
+        data = yf.download(self.ticker, start=self.start_date, end=self.end_date)
+        if 'Adj Close' in data.columns:
+            prices = data['Adj Close']
+        else:
+            prices = data['Close']
 
-    # 2. Jump Component
-    # Number of jumps in each time step follows a Poisson distribution
-    # Expected jumps in dt = lambda_jump * dt
-    N_jumps = np.random.poisson(lam=lambda_jump * dt, size=(n_steps, n_sims))
+        if isinstance(prices, pd.DataFrame):
+            prices = prices.squeeze()
 
-    # Sum of jump sizes. If N_jumps = k, we need the sum of k normal random variables
-    # We can approximate this efficiently:
-    # A sum of k identical normals N(mu_j, sigma_j^2) is distributed as N(k*mu_j, k*sigma_j^2)
-    # So, Jump_size = N_jumps * mu_jump + sqrt(N_jumps) * sigma_jump * Z_jump
-    Z_jump = np.random.standard_normal((n_steps, n_sims))
-    jump_term = N_jumps * mu_jump + np.sqrt(N_jumps) * sigma_jump * Z_jump
+        df = pd.DataFrame({'Price': prices})
+        df['LogReturn'] = np.log(df['Price'] / df['Price'].shift(1))
+        df = df.dropna()
+        return df['LogReturn'].values
 
-    # Total log returns
-    log_returns = drift_term + diffusion_term + jump_term
+    def estimate_threshold(self, returns: np.ndarray, threshold_sigma: float = 3.0):
+        overall_std = np.std(returns)
+        upper_bound = threshold_sigma * overall_std
+        lower_bound = -threshold_sigma * overall_std
 
-    # Prepend zeros for the initial state (t=0)
-    log_returns = np.vstack([np.zeros(n_sims), log_returns])
+        is_jump = (returns > upper_bound) | (returns < lower_bound)
+        jump_returns = returns[is_jump]
+        normal_returns = returns[~is_jump]
 
-    # Cumulative sum to get log prices
-    cumulative_log_returns = np.cumsum(log_returns, axis=0)
+        sigma_cont = np.std(normal_returns) / np.sqrt(self.dt)
+        mu_cont = (np.mean(normal_returns) / self.dt) + 0.5 * sigma_cont**2
 
-    # Exponentiate to get prices
-    price_paths = S0 * np.exp(cumulative_log_returns)
-    return price_paths
+        n_years = len(returns) * self.dt
+        lambda_jump = len(jump_returns) / n_years
 
-def evaluate_strategy(
-    price_paths: np.ndarray,
-    n_splits: int,
-    total_investment: float,
-    deployment_horizon: float,
-    performance_horizon: float,
-    dt: float,
-    cash_rate: float,
-    sigma: float,
-    dip_multiplier: float = 1.0
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Evaluate an N-split investment strategy with a price-contingent trigger,
-    dynamic allocation sizing (dip multiplier), and a final cash sweep.
+        if len(jump_returns) > 0:
+            mu_jump = np.mean(jump_returns)
+            sigma_jump = np.std(jump_returns)
+        else:
+            mu_jump = 0.0
+            sigma_jump = 0.0
 
-    Args:
-        price_paths: Array of simulated prices, shape (n_steps + 1, n_sims).
-        n_splits: Number of equal parts to split the investment into.
-        total_investment: Total initial cash.
-        deployment_horizon: Time over which to deploy capital (e.g., 0.5 years).
-        performance_horizon: Time at which to evaluate final value (e.g., 1.0 years).
-        dt: Time step of the simulation.
-        cash_rate: Risk-free rate for uninvested cash (annualized, continuous).
-        sigma: Volatility used to calculate the price trigger margin.
-        dip_multiplier: Multiplier for the base allocation when hitting deeper triggers.
+        return mu_cont, sigma_cont, lambda_jump, mu_jump, sigma_jump
 
-    Returns:
-        Tuple of (shares_acquired, final_portfolio_values).
-        Both are 1D arrays of length n_sims.
-    """
-    n_sims = price_paths.shape[1]
+    @staticmethod
+    def _merton_log_likelihood(params, returns, dt):
+        mu, sigma, lam, mu_j, sigma_j = params
+        if sigma <= 0 or lam < 0 or sigma_j <= 0:
+            return 1e10
 
-    if n_splits == 1:
-        # Lump sum at t=0
-        shares_acquired = total_investment / price_paths[0, :]
-        final_prices = price_paths[-1, :]
-        final_values = shares_acquired * final_prices
-        return shares_acquired, final_values
+        max_jumps = 10
+        n = len(returns)
+        pdf = np.zeros(n)
 
-    # Sizing logic: Calculate the maximum possible units if all triggers hit
-    # U_max = 1 (t=0) + sum_{k=1}^{n_splits-1} (1 + k * dip_multiplier)
-    u_max = 1.0
-    for k in range(1, n_splits):
-        u_max += (1.0 + k * dip_multiplier)
+        for j in range(max_jumps):
+            poisson_prob = stats.poisson.pmf(j, lam * dt)
+            mean_j = (mu - 0.5 * sigma**2) * dt + j * mu_j
+            var_j = sigma**2 * dt + j * sigma_j**2
+            std_j = np.sqrt(var_j)
+            norm_pdf = stats.norm.pdf(returns, loc=mean_j, scale=std_j)
+            pdf += poisson_prob * norm_pdf
 
-    base_allocation = total_investment / u_max
+        pdf = np.maximum(pdf, 1e-10)
+        return -np.sum(np.log(pdf))
 
-    # Calculate target dates for the time-based fallback
-    deployment_times = np.linspace(0, deployment_horizon, n_splits)
-    target_indices = np.round(deployment_times / dt).astype(int)
+    def estimate_mle(self, returns: np.ndarray, initial_guess: tuple):
+        bounds = (
+            (None, None),
+            (1e-4, 2.0),
+            (0.0, 50.0),
+            (-1.0, 1.0),
+            (1e-4, 1.0)
+        )
+        result = minimize(
+            self._merton_log_likelihood,
+            initial_guess,
+            args=(returns, self.dt),
+            method='L-BFGS-B',
+            bounds=bounds
+        )
+        return result.x
 
-    total_shares = np.zeros(n_sims)
-    remaining_cash = np.full(n_sims, total_investment)
+    def get_empirical_ratios(self) -> Tuple[float, float, float]:
+        """Returns averaged (lambda_jump, mu_jump_ratio, sigma_jump_ratio) from Threshold & MLE."""
+        returns = self.download_data()
 
-    # Track which index in the simulation each path is currently at
-    current_indices = np.zeros(n_sims, dtype=int)
+        # 1. Threshold Method
+        mu_a, sig_a, lam_a, mu_j_a, sig_j_a = self.estimate_threshold(returns)
+        ratio_mu_a = mu_j_a / sig_a
+        ratio_sig_a = sig_j_a / sig_a
 
-    # 1. First Allocation at t=0 (Always 1 base unit)
-    deploy_cash = np.minimum(base_allocation, remaining_cash)
-    current_prices = price_paths[0, :]
-    total_shares += deploy_cash / current_prices
-    remaining_cash -= deploy_cash
+        # 2. MLE Method
+        initial_guess = (mu_a, sig_a, lam_a, mu_j_a, max(sig_j_a, 0.01))
+        mu_b, sig_b, lam_b, mu_j_b, sig_j_b = self.estimate_mle(returns, initial_guess)
+        ratio_mu_b = mu_j_b / sig_b
+        ratio_sig_b = sig_j_b / sig_b
 
-    S0 = price_paths[0, 0] # Initial stock price is the same for all paths
+        # 3. Average the methods
+        avg_lam = (lam_a + lam_b) / 2.0
+        avg_ratio_mu = (ratio_mu_a + ratio_mu_b) / 2.0
+        avg_ratio_sig = (ratio_sig_a + ratio_sig_b) / 2.0
 
-    # Process remaining allocations 1 through N-1
-    for k in range(1, n_splits):
-        target_idx = target_indices[k]
+        print("\n--- S&P 500 Empirical Crash Calibration (2000-2025) ---")
+        print(f"Threshold Ratios : μ_j/σ = {ratio_mu_a:.3f}, σ_j/σ = {ratio_sig_a:.3f}")
+        print(f"MLE Ratios       : μ_j/σ = {ratio_mu_b:.3f}, σ_j/σ = {ratio_sig_b:.3f}")
+        print(f"AVERAGED RATIOS  : μ_j/σ = {avg_ratio_mu:.3f}, σ_j/σ = {avg_ratio_sig:.3f}")
+        print(f"AVERAGE FREQ (λ) : {avg_lam:.2f} jumps/year")
+        print("------------------------------------------------------\n")
 
-        # Cascading trigger price: drop by k * 0.25 * sigma
-        trigger_margin = k * 0.25 * sigma
-        trigger_price = S0 * max(0.0, 1.0 - trigger_margin) # Prevent negative prices
+        return avg_lam, avg_ratio_mu, avg_ratio_sig
 
-        # Vectorized approach to find the first time price drops below trigger_price
-        time_steps = np.arange(target_idx + 1)[:, None]
-        valid_search_mask = (time_steps > current_indices) & (time_steps <= target_idx)
 
-        trigger_mask = (price_paths[:target_idx + 1, :] <= trigger_price) & valid_search_mask
+class MarketDynamics:
+    """Simulates asset price paths using Merton Jump-Diffusion."""
 
-        first_hit_indices = np.argmax(trigger_mask, axis=0)
-        hit_trigger = trigger_mask[first_hit_indices, np.arange(n_sims)]
+    @staticmethod
+    def simulate_paths(
+        S0: float, mu: float, sigma: float,
+        lambda_jump: float, ratio_mu: float, ratio_sig: float,
+        T: float, dt: float, n_sims: int
+    ) -> np.ndarray:
 
-        deploy_indices = np.where(hit_trigger, first_hit_indices, target_idx)
-        deploy_times_array = deploy_indices * dt
+        n_steps = int(T / dt)
 
-        execution_prices = price_paths[deploy_indices, np.arange(n_sims)]
+        # Dynamic jump scaling based on empirical S&P 500 ratios
+        mu_jump = ratio_mu * sigma
+        sigma_jump = ratio_sig * sigma
 
-        # Grow the remaining cash from the PREVIOUS execution time to THIS execution time
-        prev_deploy_times = current_indices * dt
-        time_diffs = deploy_times_array - prev_deploy_times
-        remaining_cash = remaining_cash * np.exp(cash_rate * time_diffs)
+        # Continuous GBM
+        Z = np.random.standard_normal((n_steps, n_sims))
+        drift_term = (mu - 0.5 * sigma**2) * dt
+        diffusion_term = sigma * np.sqrt(dt) * Z
 
-        # Determine how much cash to deploy
-        # If trigger hit: Base * (1 + k * dip_multiplier)
-        # If fallback: Base
-        allocation_multiplier = np.where(hit_trigger, 1.0 + k * dip_multiplier, 1.0)
-        desired_deploy_cash = base_allocation * allocation_multiplier
+        # Jumps
+        N_jumps = np.random.poisson(lam=lambda_jump * dt, size=(n_steps, n_sims))
+        Z_jump = np.random.standard_normal((n_steps, n_sims))
+        jump_term = N_jumps * mu_jump + np.sqrt(N_jumps) * sigma_jump * Z_jump
 
-        # We can't deploy more cash than we have
-        actual_deploy_cash = np.minimum(desired_deploy_cash, remaining_cash)
+        log_returns = drift_term + diffusion_term + jump_term
+        log_returns = np.vstack([np.zeros(n_sims), log_returns])
 
-        total_shares += actual_deploy_cash / execution_prices
-        remaining_cash -= actual_deploy_cash
+        cumulative_log_returns = np.cumsum(log_returns, axis=0)
+        return S0 * np.exp(cumulative_log_returns)
 
-        current_indices = deploy_indices
 
-    # The Sweep: Deploy all remaining cash at the end of the deployment horizon
-    final_target_idx = target_indices[-1]
+class ExecutionStrategy:
+    """Evaluates the 'Buy the Dip' cascading trigger and sweep strategy."""
 
-    # Grow remaining cash from the LAST execution time to the FINAL deployment horizon time
-    final_time_diffs = (final_target_idx * dt) - (current_indices * dt)
-    # Some paths might already be at the final_target_idx, where time_diffs is 0
-    remaining_cash = remaining_cash * np.exp(cash_rate * final_time_diffs)
+    @staticmethod
+    def evaluate(
+        price_paths: np.ndarray,
+        n_splits: int,
+        total_investment: float,
+        deployment_horizon: float,
+        dt: float,
+        cash_rate: float,
+        sigma: float,
+        dip_multiplier: float = 1.0
+    ) -> Tuple[np.ndarray, np.ndarray]:
 
-    final_deployment_prices = price_paths[final_target_idx, :]
+        n_sims = price_paths.shape[1]
 
-    # Sweep
-    total_shares += remaining_cash / final_deployment_prices
-    remaining_cash = 0.0 # All cash deployed
+        if n_splits == 1:
+            shares = total_investment / price_paths[0, :]
+            final_vals = shares * price_paths[-1, :]
+            return shares, final_vals
 
-    # Calculate final value at year 1
-    final_prices = price_paths[-1, :]
-    final_values = total_shares * final_prices
+        u_max = 1.0
+        for k in range(1, n_splits):
+            u_max += (1.0 + k * dip_multiplier)
 
-    return total_shares, final_values
+        base_allocation = total_investment / u_max
+        deployment_times = np.linspace(0, deployment_horizon, n_splits)
+        target_indices = np.round(deployment_times / dt).astype(int)
 
-def run_simulation_grid():
-    # Parameters
-    S0 = 100.0
-    total_investment = 10000.0
-    deployment_horizon = 0.5  # 6 months
-    performance_horizon = 1.0 # 1 year
-    dt = 1/252.0  # Daily steps
-    n_sims = 10000
-    cash_rate = 0.03
+        total_shares = np.zeros(n_sims)
+        remaining_cash = np.full(n_sims, total_investment)
+        current_indices = np.zeros(n_sims, dtype=int)
 
-    # Ranges (Continuous)
-    # Drift from -10% to +30%
-    mu_range = np.linspace(-0.10, 0.30, 41)
-    # Volatility from 5% to 50%
-    sigma_range = np.linspace(0.05, 0.50, 46)
+        # t=0 Allocation
+        deploy_cash = np.minimum(base_allocation, remaining_cash)
+        total_shares += deploy_cash / price_paths[0, :]
+        remaining_cash -= deploy_cash
+        S0 = price_paths[0, 0]
 
-    # Jump Frequency (Fixed)
-    lambda_jump = 4.0
+        # Cascading allocations
+        for k in range(1, n_splits):
+            target_idx = target_indices[k]
+            trigger_margin = k * 0.25 * sigma
+            trigger_price = S0 * max(0.0, 1.0 - trigger_margin)
 
-    # Strategies: 1 (Lump Sum), 2, 3, 4, 6 (monthly over 6m)
-    splits_to_test = [1, 2, 3, 4, 6]
-    dip_multiplier = 1.0 # E.g., double the base allocation on the first drop
+            time_steps = np.arange(target_idx + 1)[:, None]
+            valid_search_mask = (time_steps > current_indices) & (time_steps <= target_idx)
+            trigger_mask = (price_paths[:target_idx + 1, :] <= trigger_price) & valid_search_mask
 
-    results_median = np.zeros((len(mu_range), len(sigma_range)))
-    results_shares = np.zeros((len(mu_range), len(sigma_range)))
+            first_hit_indices = np.argmax(trigger_mask, axis=0)
+            hit_trigger = trigger_mask[first_hit_indices, np.arange(n_sims)]
 
-    print("Starting Merton Jump-Diffusion simulation grid...")
-    for i, mu in enumerate(mu_range):
-        for j, sigma in enumerate(sigma_range):
+            deploy_indices = np.where(hit_trigger, first_hit_indices, target_idx)
+            deploy_times_array = deploy_indices * dt
+            execution_prices = price_paths[deploy_indices, np.arange(n_sims)]
 
-            # Jump parameters dynamically scaled to asset volatility
-            mu_jump = -0.25 * sigma    # E.g. at 20% vol, average jump is -5%
-            sigma_jump = 0.25 * sigma  # E.g. at 20% vol, jump volatility is 5%
+            time_diffs = deploy_times_array - (current_indices * dt)
+            remaining_cash = remaining_cash * np.exp(cash_rate * time_diffs)
 
-            # Simulate paths for this (mu, sigma) pair
-            np.random.seed(42) # For reproducibility and fair comparison across splits
-            price_paths = simulate_merton_jump_diffusion(
-                S0, mu, sigma,
-                lambda_jump, mu_jump, sigma_jump,
-                performance_horizon, dt, n_sims
-            )
+            allocation_multiplier = np.where(hit_trigger, 1.0 + k * dip_multiplier, 1.0)
+            actual_deploy_cash = np.minimum(base_allocation * allocation_multiplier, remaining_cash)
 
-            best_median_split = None
-            max_median_value = -np.inf
+            total_shares += actual_deploy_cash / execution_prices
+            remaining_cash -= actual_deploy_cash
+            current_indices = deploy_indices
 
-            best_shares_split = None
-            max_expected_shares = -np.inf
+        # Final Sweep
+        final_idx = target_indices[-1]
+        final_time_diffs = (final_idx * dt) - (current_indices * dt)
+        remaining_cash = remaining_cash * np.exp(cash_rate * final_time_diffs)
 
-            for n_splits in splits_to_test:
-                shares, final_values = evaluate_strategy(
-                    price_paths, n_splits, total_investment,
-                    deployment_horizon, performance_horizon, dt, cash_rate, sigma, dip_multiplier
+        total_shares += remaining_cash / price_paths[final_idx, :]
+
+        final_values = total_shares * price_paths[-1, :]
+        return total_shares, final_values
+
+
+class GridSimulator:
+    """Orchestrates the grid simulation and generates heatmaps."""
+
+    def __init__(self):
+        self.S0 = 100.0
+        self.total_investment = 10000.0
+        self.deployment_horizon = 0.5
+        self.performance_horizon = 1.0
+        self.dt = 1/252.0
+        self.n_sims = 10000
+        self.cash_rate = 0.03
+        self.dip_multiplier = 1.0
+        self.splits_to_test = [1, 2, 3, 4, 6]
+
+        self.mu_range = np.linspace(-0.10, 0.30, 41)
+        self.sigma_range = np.linspace(0.05, 0.50, 46)
+
+    def run_and_plot(self):
+        # 1. Get Empirical Parameters
+        estimator = SP500Estimator()
+        emp_lam, emp_ratio_mu, emp_ratio_sig = estimator.get_empirical_ratios()
+
+        results_median = np.zeros((len(self.mu_range), len(self.sigma_range)))
+        results_shares = np.zeros((len(self.mu_range), len(self.sigma_range)))
+
+        print("Starting OOP Grid Simulation...")
+        for i, mu in enumerate(self.mu_range):
+            for j, sigma in enumerate(self.sigma_range):
+                np.random.seed(42)
+
+                # Generate paths using the empirical ratios
+                price_paths = MarketDynamics.simulate_paths(
+                    self.S0, mu, sigma,
+                    emp_lam, emp_ratio_mu, emp_ratio_sig,
+                    self.performance_horizon, self.dt, self.n_sims
                 )
 
-                # Metric 1: Median Final Value
-                median_value = np.median(final_values)
-                if median_value > max_median_value:
-                    max_median_value = median_value
-                    best_median_split = n_splits
+                best_median_split = None
+                max_median = -np.inf
+                best_shares_split = None
+                max_shares = -np.inf
 
-                # Metric 2: Expected (Mean) Number of Shares
-                expected_shares = np.mean(shares)
-                if expected_shares > max_expected_shares:
-                    max_expected_shares = expected_shares
-                    best_shares_split = n_splits
+                for n_splits in self.splits_to_test:
+                    shares, final_vals = ExecutionStrategy.evaluate(
+                        price_paths, n_splits, self.total_investment,
+                        self.deployment_horizon, self.dt, self.cash_rate,
+                        sigma, self.dip_multiplier
+                    )
 
-            results_median[i, j] = best_median_split
-            results_shares[i, j] = best_shares_split
+                    median_val = np.median(final_vals)
+                    if median_val > max_median:
+                        max_median = median_val
+                        best_median_split = n_splits
 
-    print("Simulation complete. Generating heatmaps...")
+                    mean_shares = np.mean(shares)
+                    if mean_shares > max_shares:
+                        max_shares = mean_shares
+                        best_shares_split = n_splits
 
-    # Generate Heatmaps
-    mu_labels = [f"{m:.0%}" for m in mu_range]
-    sigma_labels = [f"{s:.0%}" for s in sigma_range]
+                results_median[i, j] = best_median_split
+                results_shares[i, j] = best_shares_split
 
-    # Ensure consistent formatting for labels to avoid clutter
-    # Subsample ticks for cleaner axis
-    mu_ticks = np.arange(0, len(mu_range), 5)
-    sigma_ticks = np.arange(0, len(sigma_range), 5)
+        print("Generating Heatmaps...")
+        self._plot_heatmap(results_median, "heatmap_median_value.png",
+                           f"Optimal Splits (Median Value)\nEmpirical S&P500 Jumps: μ_j={emp_ratio_mu:.2f}σ, σ_j={emp_ratio_sig:.2f}σ")
 
-    # 1. Heatmap for Median Final Value
-    plt.figure(figsize=(10, 8))
-    ax = sns.heatmap(results_median, cmap="YlGnBu",
-                     xticklabels=sigma_labels, yticklabels=mu_labels)
-    ax.invert_yaxis() # Put lower drifts at the bottom
+        self._plot_heatmap(results_shares, "heatmap_expected_shares.png",
+                           f"Optimal Splits (Expected Shares)\nEmpirical S&P500 Jumps: μ_j={emp_ratio_mu:.2f}σ, σ_j={emp_ratio_sig:.2f}σ")
 
-    # Adjust ticks
-    ax.set_xticks(sigma_ticks + 0.5)
-    ax.set_xticklabels([sigma_labels[i] for i in sigma_ticks])
-    ax.set_yticks(mu_ticks + 0.5)
-    ax.set_yticklabels([mu_labels[i] for i in mu_ticks])
+    def _plot_heatmap(self, data: np.ndarray, filename: str, title: str):
+        mu_labels = [f"{m:.0%}" for m in self.mu_range]
+        sigma_labels = [f"{s:.0%}" for s in self.sigma_range]
+        mu_ticks = np.arange(0, len(self.mu_range), 5)
+        sigma_ticks = np.arange(0, len(self.sigma_range), 5)
 
-    plt.title(f"Optimal Splits for Median Final Value\nAssuming Jumps: λ={lambda_jump}, μ_j=-0.25σ, σ_j=0.25σ")
-    plt.xlabel("Continuous Volatility (σ)")
-    plt.ylabel("Continuous Drift (μ)")
-    plt.savefig("heatmap_median_value.png", dpi=300, bbox_inches='tight')
-    plt.close()
+        plt.figure(figsize=(10, 8))
+        ax = sns.heatmap(data, cmap="YlGnBu" if "Median" in title else "YlOrRd",
+                         xticklabels=sigma_labels, yticklabels=mu_labels)
+        ax.invert_yaxis()
+        ax.set_xticks(sigma_ticks + 0.5)
+        ax.set_xticklabels([sigma_labels[i] for i in sigma_ticks])
+        ax.set_yticks(mu_ticks + 0.5)
+        ax.set_yticklabels([mu_labels[i] for i in mu_ticks])
 
-    # 2. Heatmap for Expected Shares
-    plt.figure(figsize=(10, 8))
-    ax2 = sns.heatmap(results_shares, cmap="YlOrRd",
-                      xticklabels=sigma_labels, yticklabels=mu_labels)
-    ax2.invert_yaxis()
+        plt.title(title)
+        plt.xlabel("Continuous Volatility (σ)")
+        plt.ylabel("Continuous Drift (μ)")
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
 
-    # Adjust ticks
-    ax2.set_xticks(sigma_ticks + 0.5)
-    ax2.set_xticklabels([sigma_labels[i] for i in sigma_ticks])
-    ax2.set_yticks(mu_ticks + 0.5)
-    ax2.set_yticklabels([mu_labels[i] for i in mu_ticks])
-
-    plt.title(f"Optimal Splits for Expected Shares Acquired\nAssuming Jumps: λ={lambda_jump}, μ_j=-0.25σ, σ_j=0.25σ")
-    plt.xlabel("Continuous Volatility (σ)")
-    plt.ylabel("Continuous Drift (μ)")
-    plt.savefig("heatmap_expected_shares.png", dpi=300, bbox_inches='tight')
-    plt.close()
-
-    print("Heatmaps saved to 'heatmap_median_value.png' and 'heatmap_expected_shares.png'.")
 
 if __name__ == "__main__":
-    run_simulation_grid()
+    simulator = GridSimulator()
+    simulator.run_and_plot()
